@@ -1,0 +1,208 @@
+rules_version = '2';
+
+// StudyVault Firestore Security Rules.
+// Principles: clients may only change their own drafts and display fields.
+// Points, grades, moderation state, ratings, ledger, and audit entries are written by Cloud Functions only.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // Admin status comes ONLY from the Firebase Auth custom claim (set via functions/grantAdmin.js).
+    function isAdmin() {
+      return signedIn() && request.auth.token.admin == true;
+    }
+
+    function isOwner(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function isSuspended() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.suspended == true;
+    }
+
+    function active() {
+      return signedIn() && !isSuspended();
+    }
+
+    function changedKeys() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    /* ----- Private account record: owner reads; only admins change it (suspension goes through a function) ----- */
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      allow create: if isOwner(uid)
+        && request.resource.data.role == 'student'
+        && request.resource.data.suspended == false
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.keys().hasOnly(['email', 'role', 'suspended', 'createdAt', 'lastLoginAt']);
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    /* ----- Public student profile ----- */
+    match /publicProfiles/{uid} {
+      allow read: if signedIn();
+
+      allow create: if isOwner(uid)
+        && request.resource.data.uid == uid
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() >= 2
+        && request.resource.data.displayName.size() <= 60
+        && request.resource.data.semester is int
+        && request.resource.data.semester >= 1
+        && request.resource.data.semester <= 8
+        && request.resource.data.points == 0
+        && request.resource.data.weeklyPoints == 0
+        && request.resource.data.pendingPoints == 0
+        && request.resource.data.submissionCount == 0
+        && request.resource.data.publishedCount == 0
+        && request.resource.data.topicCount == 0
+        && request.resource.data.helpfulCount == 0
+        && request.resource.data.keys().hasOnly([
+          'uid', 'displayName', 'photoURL', 'department', 'semester', 'bio', 'skills',
+          'points', 'weeklyPoints', 'weekKey', 'pendingPoints', 'grade',
+          'submissionCount', 'publishedCount', 'topicCount', 'helpfulCount',
+          'helpfulWeekKey', 'helpfulWeekPoints', 'createdAt'
+        ]);
+
+      // Students edit display fields only. Points, grade, weekly totals, and counters are server-owned.
+      allow update: if isOwner(uid)
+        && changedKeys().hasOnly(['displayName', 'photoURL', 'department', 'semester', 'bio', 'skills'])
+        && (!('displayName' in request.resource.data) || request.resource.data.displayName.size() <= 60)
+        && (!('bio' in request.resource.data) || request.resource.data.bio.size() <= 300);
+
+      allow delete: if false;
+    }
+
+    /* ----- Catalog: readable by signed-in students, managed by admins ----- */
+    match /subjects/{subjectId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    match /lessons/{lessonId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    /* ----- Notes (document-level submissions) ----- */
+    match /notes/{noteId} {
+      allow read: if (signedIn() && resource.data.status == 'published')
+        || isOwner(resource.data.ownerId)
+        || isAdmin();
+
+      // Students create drafts only; points and status are server-controlled.
+      allow create: if active()
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.status == 'draft'
+        && request.resource.data.awardedPoints == 0
+        && request.resource.data.provisionalPoints == 0
+        && request.resource.data.title is string
+        && request.resource.data.title.size() <= 140;
+
+      // Owners edit drafts and returned (rejected) notes. Status can only stay/return to draft.
+      allow update: if active()
+        && isOwner(resource.data.ownerId)
+        && resource.data.status in ['draft', 'rejected']
+        && request.resource.data.status == 'draft'
+        && request.resource.data.ownerId == resource.data.ownerId
+        && request.resource.data.awardedPoints == resource.data.awardedPoints
+        && request.resource.data.provisionalPoints == resource.data.provisionalPoints;
+
+      allow delete: if active()
+        && isOwner(resource.data.ownerId)
+        && resource.data.status in ['draft', 'rejected'];
+    }
+
+    /* ----- Topics (the learning content) ----- */
+    match /topics/{topicId} {
+      allow read: if (signedIn() && resource.data.status == 'published')
+        || isOwner(resource.data.ownerId)
+        || isAdmin();
+
+      allow create: if active()
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.status == 'draft'
+        && request.resource.data.views == 0
+        && request.resource.data.helpfulCount == 0
+        && request.resource.data.title is string
+        && request.resource.data.title.size() <= 140
+        && (!('explanation' in request.resource.data) || request.resource.data.explanation.size() <= 20000);
+
+      // 1) Owners edit drafts and returned topics without touching counters.
+      // 2) Owners stage revisions for published topics; moderators approve them.
+      // 3) Any signed-in reader may increment the view counter of a published topic.
+      allow update: if (active()
+          && isOwner(resource.data.ownerId)
+          && resource.data.status in ['draft', 'rejected']
+          && request.resource.data.status == 'draft'
+          && request.resource.data.ownerId == resource.data.ownerId
+          && request.resource.data.views == resource.data.views
+          && request.resource.data.helpfulCount == resource.data.helpfulCount)
+        || (active()
+          && isOwner(resource.data.ownerId)
+          && resource.data.status == 'published'
+          && changedKeys().hasOnly(['pendingRevision', 'hasPendingRevision', 'updatedAt']))
+        || (signedIn()
+          && resource.data.status == 'published'
+          && changedKeys().hasOnly(['views']));
+
+      allow delete: if active()
+        && isOwner(resource.data.ownerId)
+        && resource.data.status in ['draft', 'rejected'];
+    }
+
+    /* ----- Per-student topic state (bookmarks, completion, last viewed). Document id: uid_topicId ----- */
+    match /bookmarks/{id} {
+      allow read: if signedIn() && resource.data.uid == request.auth.uid;
+      allow create, update: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && id == request.auth.uid + '_' + request.resource.data.topicId;
+      allow delete: if signedIn() && resource.data.uid == request.auth.uid;
+    }
+
+    /* ----- Helpful votes: written by the markTopicHelpful function only ----- */
+    match /ratings/{id} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    /* ----- Reports: anyone signed in can report; only admins resolve ----- */
+    match /reports/{reportId} {
+      allow create: if signedIn()
+        && request.resource.data.reporterId == request.auth.uid
+        && request.resource.data.status == 'open';
+      allow read: if isAdmin() || (signedIn() && resource.data.reporterId == request.auth.uid);
+      allow update, delete: if isAdmin();
+    }
+
+    /* ----- Contribution ledger: written by Cloud Functions only ----- */
+    match /contributionEvents/{eventId} {
+      allow read: if isAdmin() || (signedIn() && resource.data.ownerId == request.auth.uid);
+      allow write: if false;
+    }
+
+    /* ----- Audit log: admins read; admins may add entries as themselves ----- */
+    match /auditLogs/{logId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() && request.resource.data.actorId == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    /* ----- Server-only usage counters ----- */
+    match /aiUsage/{usageId} {
+      allow read, write: if false;
+    }
+
+    /* ----- Default deny ----- */
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

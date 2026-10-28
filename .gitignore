@@ -1,0 +1,24 @@
+# Dependencies and build output
+node_modules/
+dist/
+functions/node_modules/
+
+# Environment files and credentials (never commit these)
+.env
+.env.*
+!.env.example
+*service-account*.json
+*-adminsdk-*.json
+
+# Firebase local tooling
+.firebase/
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+database-debug.log
+*.local
+
+# Editors and OS files
+.DS_Store
+.vscode/
+.idea/

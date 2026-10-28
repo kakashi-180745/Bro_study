@@ -1,0 +1,60 @@
+rules_version = '2';
+
+// StudyVault Storage Security Rules.
+// Enforced: ownership on write, file type, size limits, and read access tied to publication state.
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return signedIn() && request.auth.token.admin == true;
+    }
+
+    function notePublished(noteId) {
+      return firestore.exists(/databases/(default)/documents/notes/$(noteId))
+        && firestore.get(/databases/(default)/documents/notes/$(noteId)).data.status == 'published';
+    }
+
+    // Source PDFs: owners upload and read; signed-in students read PDFs of published notes.
+    match /pdfs/{uid}/{noteId}/{fileName} {
+      allow read: if isAdmin()
+        || (signedIn() && request.auth.uid == uid)
+        || (signedIn() && notePublished(noteId));
+      allow create, update: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.size < 15 * 1024 * 1024
+        && request.resource.contentType == 'application/pdf'
+        && fileName.matches('.*\\.[Pp][Dd][Ff]$');
+      allow delete: if signedIn() && request.auth.uid == uid;
+    }
+
+    // Topic images and diagrams.
+    match /topicImages/{uid}/{noteId}/{fileName} {
+      allow read: if isAdmin()
+        || (signedIn() && request.auth.uid == uid)
+        || (signedIn() && notePublished(noteId));
+      allow create, update: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.size < 3 * 1024 * 1024
+        && request.resource.contentType.matches('image/(png|jpeg|webp|gif)');
+      allow delete: if signedIn() && request.auth.uid == uid;
+    }
+
+    // Profile photos.
+    match /avatars/{uid}/{fileName} {
+      allow read: if signedIn();
+      allow create, update: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.size < 2 * 1024 * 1024
+        && request.resource.contentType.matches('image/(png|jpeg|webp|gif)');
+      allow delete: if signedIn() && request.auth.uid == uid;
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
